@@ -53,9 +53,9 @@
         {%- for tool in message['tool_calls'] %}
             {%- if not ns.is_first %}
                 {%- if message['content'] is none %}
-                    {{'<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments']|tojson + '\n' + '```' + '<｜tool▁call▁end｜>'}}
+                    {{- '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments']|tojson + '\n' + '```' + '<｜tool▁call▁end｜>' -}}
                 {%- else %}
-                    {{message['content'] + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments']|tojson + '\n' + '```' + '<｜tool▁call▁end｜>'}}
+                    {{ message['content'] + '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>' + tool['type'] + '<｜tool▁sep｜>' + tool['function']['name'] + '\n' + '```json' + '\n' + tool['function']['arguments']|tojson + '\n' + '```' + '<｜tool▁call▁end｜>' -}}
                 {%- endif %}
             {%- set ns.is_first = true -%}
             {%- else %}
