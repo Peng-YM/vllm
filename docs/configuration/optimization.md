@@ -27,8 +27,6 @@ You can monitor the number of preemption requests through Prometheus metrics exp
 
 In vLLM V1, the default preemption mode is `RECOMPUTE` rather than `SWAP`, as recomputation has lower overhead in the V1 architecture.
 
-[](){ #chunked-prefill }
-
 ## Chunked Prefill
 
 Chunked prefill allows vLLM to process large prefills in smaller chunks and batch them together with decode requests. This feature helps improve both throughput and latency by better balancing compute-bound (prefill) and memory-bound (decode) operations.
@@ -100,7 +98,7 @@ from vllm import LLM
 llm = LLM(
     model="meta-llama/Llama-3.3-70B-Instruct,
     tensor_parallel_size=4,
-    pipeline_parallel_size=2
+    pipeline_parallel_size=2,
 )
 ```
 
@@ -139,9 +137,9 @@ there is relatively little gain from TP. On the other hand, TP incurs significan
 overhead because of all-reduce being performed after every layer.
 
 Given this, it may be advantageous to instead shard the batched input data using TP, essentially
-performing batch-level DP. This has been shown to improve the throughput by around 10% for
+performing batch-level DP. This has been shown to improve the throughput and TTFT by around 10% for
 `tensor_parallel_size=8`. For vision encoders that use hardware-unoptimized Conv3D operations,
-batch-level DP can provide another 40% increase to throughput compared to regular TP.
+batch-level DP can provide another 40% improvement compared to regular TP.
 
 Nevertheless, since the weights of the multi-modal encoder are replicated across each TP rank,
 there will be a minor increase in memory consumption and may cause OOM if you can barely fit the model already.
@@ -153,26 +151,35 @@ from vllm import LLM
 
 llm = LLM(
     model="Qwen/Qwen2.5-VL-72B-Instruct",
-    # Create two EngineCore instances, one per DP rank
-    data_parallel_size=2,
-    # Within each EngineCore instance:
-    # The vision encoder uses TP=4 (not DP=2) to shard the input data
-    # The language decoder uses TP=4 to shard the weights as usual
     tensor_parallel_size=4,
+    # When mm_encoder_tp_mode="data",
+    # the vision encoder uses TP=4 (not DP=1) to shard the input data,
+    # so the TP size becomes the effective DP size.
+    # Note that this is independent of the DP size for language decoder which is used in expert parallel setting.
     mm_encoder_tp_mode="data",
+    # The language decoder uses TP=4 to shard the weights regardless
+    # of the setting of mm_encoder_tp_mode
 )
 ```
 
-!! important
+!!! important
     Batch-level DP is not to be confused with API request-level DP
     (which is instead controlled by `data_parallel_size`).
 
-The availablilty of batch-level DP is based on model implementation.
-Currently, the following models support `mm_encoder_tp_mode="data"`:
+Batch-level DP needs to be implemented on a per-model basis,
+and enabled by setting `supports_encoder_tp_data = True` in the model class.
+Regardless, you need to set `mm_encoder_tp_mode="data"` in engine arguments to use this feature.
 
-- Llama4 (<gh-pr:18368>)
-- Qwen2.5-VL (<gh-pr:22742>)
-- Step3 (<gh-pr:22697>)
+Known supported models (with corresponding benchmarks):
+
+- dots_ocr (<https://github.com/vllm-project/vllm/pull/25466>)
+- GLM-4.1V or above (<https://github.com/vllm-project/vllm/pull/23168>)
+- InternVL (<https://github.com/vllm-project/vllm/pull/23909>)
+- Kimi-VL (<https://github.com/vllm-project/vllm/pull/23817>)
+- Llama4 (<https://github.com/vllm-project/vllm/pull/18368>)
+- MiniCPM-V-2.5 or above (<https://github.com/vllm-project/vllm/pull/23327>, <https://github.com/vllm-project/vllm/pull/23948>)
+- Qwen2-VL or above (<https://github.com/vllm-project/vllm/pull/22742>, <https://github.com/vllm-project/vllm/pull/24955>, <https://github.com/vllm-project/vllm/pull/25445>)
+- Step3 (<https://github.com/vllm-project/vllm/pull/22697>)
 
 ## Input Processing
 
@@ -194,30 +201,90 @@ vllm serve Qwen/Qwen2.5-VL-3B-Instruct --api-server-count 4 -dp 2
 !!! note
     API server scale-out is only available for online inference.
 
+!!! warning
+    By default, 8 CPU threads are used in each API server to load media items (e.g. images)
+    from request data.
+
+    If you apply API server scale-out, consider adjusting `VLLM_MEDIA_LOADING_THREAD_COUNT`
+    to avoid CPU resource exhaustion.
+
 !!! note
-    [Multi-modal processor cache](#processor-cache) is disabled when API server scale-out is enabled
-    because it requires a one-to-one correspondance between API and engine core processes.
+    API server scale-out disables [multi-modal IPC caching](#ipc-caching)
+    because it requires a one-to-one correspondence between API and engine core processes.
+
+    This does not impact [multi-modal processor caching](#processor-caching).
 
 ## Multi-Modal Caching
 
-### Processor Cache
-
-By default, the multi-modal processor cache is enabled to avoid repeatedly processing
-the same multi-modal inputs via Hugging Face `AutoProcessor`,
+Multi-modal caching avoids repeated transfer or processing of the same multi-modal data,
 which commonly occurs in multi-turn conversations.
 
-You can adjust the size of the cache by setting the value of `mm_processor_cache_gb`
-(default 4 GiB per API process + 4 GiB per engine core process).
-If you do not benefit much from the cache, you can disable it completely via `mm_processor_cache_gb=0`.
+### Processor Caching
+
+Multi-modal processor caching is automatically enabled
+to avoid repeatedly processing the same multi-modal inputs in `BaseMultiModalProcessor`.
+
+### IPC Caching
+
+Multi-modal IPC caching is automatically enabled when
+there is a one-to-one correspondence between API (`P0`) and engine core (`P1`) processes,
+to avoid repeatedly transferring the same multi-modal inputs between them.
+
+#### Key-Replicated Cache
+
+By default, IPC caching uses a **key-replicated cache**, where cache keys exist
+in both the API (`P0`) and engine core (`P1`) processes, but the actual cache
+data resides only in `P1`.
+
+#### Shared Memory Cache
+
+When multiple worker processes are involved (e.g., when TP > 1), a
+**shared-memory cache** is more efficient. This can be enabled by setting
+`mm_processor_cache_type="shm"`. In this mode, cache keys are stored
+on `P0`, while the cache data itself lives in shared memory accessible by all
+processes.
+
+### Configuration
+
+You can adjust the size of the cache by setting the value of `mm_processor_cache_gb` (default 4 GiB).
+
+If you do not benefit much from the cache, you can disable both IPC
+and processor caching completely via `mm_processor_cache_gb=0`.
 
 Examples:
 
 ```python
 # Use a larger cache
-llm = LLM(model="Qwen/Qwen2.5-VL-3B-Instruct",
-          mm_processor_cache_gb=8)
+llm = LLM(
+    model="Qwen/Qwen2.5-VL-3B-Instruct",
+    mm_processor_cache_gb=8,
+)
+
+# Use a shared-memory based IPC cache
+llm = LLM(
+    model="Qwen/Qwen2.5-VL-3B-Instruct",
+    tensor_parallel_size=2,
+    mm_processor_cache_type="shm",
+    mm_processor_cache_gb=8,
+)
 
 # Disable the cache
-llm = LLM(model="Qwen/Qwen2.5-VL-3B-Instruct",
-          mm_processor_cache_gb=0)
+llm = LLM(
+    model="Qwen/Qwen2.5-VL-3B-Instruct",
+    mm_processor_cache_gb=0,
+)
 ```
+
+### Cache Placement
+
+Based on the configuration, the content of the multi-modal caches on `P0` and `P1` are as follows:
+
+| mm_processor_cache_type | Cache Type | `P0` Cache | `P1` Engine Cache | `P1` Worker Cache | Max. Memory |
+|-------------------|-------------|------------|------------|-------------|-------------|
+| lru | Processor Caching | K + V | N/A | N/A | `mm_processor_cache_gb * data_parallel_size` |
+| lru | Key-Replicated Caching | K | K + V | N/A | `mm_processor_cache_gb * api_server_count` |
+| shm | Shared Memory Caching | K | N/A | V | `mm_processor_cache_gb * api_server_count` |
+| N/A | Disabled | N/A | N/A | N/A | `0` |
+
+K: Stores the hashes of multi-modal items  
+V: Stores the processed tensor data of multi-modal items
